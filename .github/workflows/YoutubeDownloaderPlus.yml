@@ -90,7 +90,6 @@ jobs:
           mkdir -p /tmp/url_list
           > /tmp/url_list/list.txt
 
-          # --- Determine separator character ---
           case "${{ github.event.inputs.url_separator }}" in
             ", (comma)")  SEP=",";;
             "space")      SEP=" ";;
@@ -99,7 +98,6 @@ jobs:
             *)            SEP=",";;
           esac
 
-          # --- Collect raw URLs: from 'urls' input (split by SEP) and from 'url' input ---
           if [ -n "${{ github.event.inputs.urls }}" ]; then
             echo "${{ github.event.inputs.urls }}" | tr "$SEP" '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | sed '/^\s*$/d' > /tmp/url_list/raw.txt
           fi
@@ -113,7 +111,6 @@ jobs:
             exit 1
           fi
 
-          # --- Expand playlists ---
           while read -r INPUT; do
             if yt-dlp --flat-playlist -J "$INPUT" >/tmp/pl.json 2>/dev/null; then
               COUNT=$(jq '.entries | length' /tmp/pl.json 2>/dev/null || echo 0)
@@ -150,6 +147,8 @@ jobs:
           API_ENDPOINT = "https://hub.ytconvert.org/api/download"
           STATUS_CHECK_INTERVAL = 2
           MAX_ATTEMPTS = 90
+          RETRY_SERVER_ERRORS = [500, 502, 503, 504]
+          MAX_API_RETRIES = 1  # total attempts = 1 + retry
 
           VIDEO_QUALITIES = ['144p', '360p', '480p', '720p', '1080p']
           AUDIO_BITRATES = ['64kbps', '128kbps', '192kbps', '320kbps']
@@ -193,16 +192,35 @@ jobs:
           session = requests.Session()
           session.get("https://media.ytmp3.gg/", headers=HEADERS)
 
+          def api_post(payload, retries=MAX_API_RETRIES):
+              for attempt in range(retries + 1):
+                  try:
+                      resp = session.post(API_ENDPOINT, json=payload, headers=HEADERS, timeout=30)
+                      if resp.status_code in RETRY_SERVER_ERRORS and attempt < retries:
+                          print(f"⚠️ Server error {resp.status_code}, retrying in 3s...", file=sys.stderr)
+                          time.sleep(3)
+                          continue
+                      return resp
+                  except requests.exceptions.RequestException as e:
+                      if attempt < retries:
+                          print(f"⚠️ Request error: {e}, retrying in 3s...", file=sys.stderr)
+                          time.sleep(3)
+                          continue
+                      raise
+              return resp
+
           try:
-              resp = session.post(API_ENDPOINT, json=payload, headers=HEADERS, timeout=30)
+              resp = api_post(payload)
               if resp.status_code != 200:
                   if resp.status_code == 400:
+                      # Fallback quality on 400 errors
                       if OUTPUT_TYPE == 'audio':
                           payload["audio"]["bitrate"] = "192kbps"
                       else:
                           payload["output"]["quality"] = "720p"
-                      resp = session.post(API_ENDPOINT, json=payload, headers=HEADERS, timeout=30)
-                  resp.raise_for_status()
+                      resp = api_post(payload)
+                  if resp.status_code not in RETRY_SERVER_ERRORS:  # only raise for non-retriable errors
+                      resp.raise_for_status()
               data = resp.json()
           except Exception as e:
               print(f"❌ API error: {e}", file=sys.stderr)
@@ -242,7 +260,6 @@ jobs:
           safe_title = safe_title[:60] if len(safe_title) > 60 else safe_title
           safe_title = safe_title.strip('_') or video_id
 
-          # --- Determine extension & quality label ---
           if OUTPUT_TYPE == 'audio':
               extension = "mp3"
               quality_label = QUALITY
@@ -269,12 +286,10 @@ jobs:
                   for chunk in r.iter_content(chunk_size=8192):
                       f.write(chunk)
 
-          # --- Move to final location ---
           os.makedirs(os.path.dirname(final_path), exist_ok=True)
           shutil.move(temp_file, final_path)
           print(f"✅ Download completed", file=sys.stderr)
 
-          # --- Output folder and filename (two lines) for the bash wrapper ---
           print(folder)
           print(filename)
           PYEOF
@@ -310,13 +325,12 @@ jobs:
           VIDEO_DIR="$BASE/$FOLDER"
           OUTPUT_FILE="$VIDEO_DIR/$FILENAME"
 
-          # --- Duplicate detection ---
+          # --- Duplicate detection: skip if full file or split parts already exist ---
           if [ -f "$OUTPUT_FILE" ]; then
             echo "✔ Already exists (full file), skipping"
             exit 0
           fi
 
-          # Check if a previous split exists (parts)
           NAME="${FILENAME%.*}"
           if ls "$VIDEO_DIR/${NAME}_part"* 2>/dev/null | head -n1 | grep -q .; then
             echo "✔ Already exists (split parts found), skipping"
@@ -355,7 +369,7 @@ jobs:
                 SEG_TIME=$(echo "scale=2; $TARGET_BYTES * 8 / $BITRATE" | bc)
                 SEG_TIME=$(echo "if ($SEG_TIME < 10) 10 else $SEG_TIME" | bc)
               else
-                SEG_TIME=600   # fallback: 10 minutes
+                SEG_TIME=600
               fi
 
               echo "→ Splitting by time: ~${SEG_TIME}s per part"
