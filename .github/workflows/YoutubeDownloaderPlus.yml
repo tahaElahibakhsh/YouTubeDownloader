@@ -328,10 +328,9 @@ jobs:
           EXT="${FILENAME##*.}"
 
           # --- Smart duplicate / existing file handling ---
-          DOWNLOADED_HERE=false   # flag to know if we just downloaded the file
+          DOWNLOADED_HERE=false
 
           if [ -f "$OUTPUT_FILE" ]; then
-            # Check if already split
             if ls "$VIDEO_DIR/${NAME}_part"* 2>/dev/null | head -n1 | grep -q .; then
               echo "✔ Already split, skipping"
               exit 0
@@ -342,13 +341,11 @@ jobs:
 
             if [ "$SPLIT_MB" -gt 0 ] && [ "$MB" -gt "$SPLIT_MB" ]; then
               echo "📁 Existing file (${MB}MB) needs splitting; proceeding..."
-              # fall through to split section
             else
               echo "✔ Already exists (${MB}MB), no split needed, skipping"
               exit 0
             fi
           else
-            # File doesn't exist – it was just downloaded by Python
             DOWNLOADED_HERE=true
             if [ ! -f "$OUTPUT_FILE" ]; then
               echo "❌ File missing after conversion: $OUTPUT_FILE"
@@ -356,7 +353,6 @@ jobs:
             fi
           fi
 
-          # --- Determine file size ---
           FILESIZE=$(stat -c%s "$OUTPUT_FILE")
           MB=$((FILESIZE / 1024 / 1024))
 
@@ -373,18 +369,22 @@ jobs:
               fi
               rm "$BASENAME"
             else
-              # --- mp4 split by duration ---
+              # --- MP4 split by duration with 60% safety margin ---
               DURATION=$(ffprobe -v error -show_entries format=duration \
                 -of default=noprint_wrappers=1:nokey=1 "$BASENAME")
               BITRATE=$(ffprobe -v error -show_entries format=bit_rate \
                 -of default=noprint_wrappers=1:nokey=1 "$BASENAME")
 
               if [ -n "$DURATION" ] && [ -n "$BITRATE" ] && [ "$BITRATE" != "N/A" ]; then
-                TARGET_BYTES=$(echo "$SPLIT_MB * 1024 * 1024 * 0.9" | bc)
+                # Target only 60% of the threshold to leave room for GOP overshoot
+                TARGET_MB=$(echo "scale=0; $SPLIT_MB * 0.6" | bc)
+                TARGET_BYTES=$(echo "$TARGET_MB * 1024 * 1024" | bc)
                 SEG_TIME=$(echo "scale=2; $TARGET_BYTES * 8 / $BITRATE" | bc)
                 SEG_TIME=$(echo "if ($SEG_TIME < 10) 10 else $SEG_TIME" | bc)
+                echo "→ Aiming for ~${TARGET_MB}MB per part (60% of threshold)"
               else
                 SEG_TIME=600
+                echo "→ Fallback: 10‑minute parts"
               fi
 
               echo "→ Splitting by time: ~${SEG_TIME}s per part"
@@ -407,7 +407,6 @@ jobs:
 
           chmod +x /tmp/process_url.sh
 
-          # Pass split parameters as arguments to every job
           parallel --jobs "$WORKERS" --line-buffer \
             -a /tmp/url_list/list.txt \
             bash /tmp/process_url.sh {} "$SPLIT_MB" "$SPLIT_METHOD"
