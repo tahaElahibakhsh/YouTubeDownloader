@@ -29,10 +29,19 @@ on:
         default: '720p'
 
       split_threshold_mb:
-        description: '📦 Split files larger than (MB) — 0 = never'
+        description: '✂️ Split files larger than (MB) — 0 = never'
         required: false
         type: number
         default: 90
+
+      split_method:
+        description: '🗜️ Split method (only if size > threshold)'
+        required: false
+        type: choice
+        options:
+          - zip
+          - mp4
+        default: 'zip'
 
       download_path:
         description: '📂 Folder to store downloaded content'
@@ -52,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    
+
     steps:
       - name: 📂 Clone Repository
         uses: actions/checkout@v4
@@ -62,7 +71,7 @@ jobs:
       - name: 🔧 Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y zip curl jq parallel python3-pip
+          sudo apt-get install -y zip curl jq parallel python3-pip ffmpeg
           pip install requests yt-dlp
 
       - name: 📜 Prepare URL List
@@ -102,7 +111,7 @@ jobs:
       - name: 🐍 Write Conversion Helper Script
         run: |
           cat > /tmp/yt_convert.py << 'PYEOF'
-          import sys, json, time, re, requests
+          import sys, json, time, re, requests, os, shutil
 
           if len(sys.argv) != 6:
               print("Usage: yt_convert.py <url> <type> <quality> <output_file> <temp_dir>")
@@ -163,7 +172,6 @@ jobs:
           try:
               resp = session.post(API_ENDPOINT, json=payload, headers=HEADERS, timeout=30)
               if resp.status_code != 200:
-                  # Fallback on 400
                   if resp.status_code == 400:
                       if OUTPUT_TYPE == 'audio':
                           payload["audio"]["bitrate"] = "192kbps"
@@ -200,7 +208,7 @@ jobs:
               sys.exit(1)
 
           # Download to temp file
-          temp_file = TEMP_DIR + "/" + OUTPUT_FILE.rsplit("/", 1)[-1]
+          temp_file = os.path.join(TEMP_DIR, os.path.basename(OUTPUT_FILE))
           print(f"⬇️ Downloading to {temp_file}...")
           dl_headers = {
               "User-Agent": HEADERS["User-Agent"],
@@ -213,7 +221,6 @@ jobs:
                       f.write(chunk)
 
           # Move to final location
-          import shutil, os
           os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
           shutil.move(temp_file, OUTPUT_FILE)
           print("✅ Download completed")
@@ -226,11 +233,11 @@ jobs:
           QUALITY="${{ github.event.inputs.quality }}"
           TYPE="${{ github.event.inputs.type }}"
           SPLIT_MB="${{ github.event.inputs.split_threshold_mb }}"
+          SPLIT_METHOD="${{ github.event.inputs.split_method }}"
           TEMP_DIR=$(mktemp -d)
 
-          export BASE QUALITY TYPE SPLIT_MB TEMP_DIR
+          export BASE QUALITY TYPE SPLIT_MB SPLIT_METHOD TEMP_DIR
 
-          # The per‑URL script
           cat > /tmp/process_url.sh << 'SCRIPT'
           #!/bin/bash
           URL="$1"
@@ -241,18 +248,14 @@ jobs:
           # Fast metadata lookup
           META_JSON=$(yt-dlp -J "$URL" 2>/dev/null)
           TITLE=$(echo "$META_JSON" | jq -r '.title // "video"')
-          AUTHOR=$(echo "$META_JSON" | jq -r '.uploader // "Unknown"')
           VID=$(echo "$META_JSON" | jq -r '.id // "unknown"')
 
           SAFE_TITLE=$(echo "$TITLE" | sed 's/[^a-zA-Z0-9._-]/_/g')
-          SAFE_AUTHOR=$(echo "$AUTHOR" | sed 's/[^a-zA-Z0-9._-]/_/g')
 
           EXT="mp4"
           [ "$TYPE" = "audio" ] && EXT="mp3"
 
-          OUT_DIR="$BASE/$SAFE_AUTHOR"
-          mkdir -p "$OUT_DIR"
-          OUTPUT_FILE="$OUT_DIR/${SAFE_TITLE}_${VID}_${QUALITY}.$EXT"
+          OUTPUT_FILE="$BASE/${SAFE_TITLE}_${VID}_${QUALITY}.$EXT"
 
           if [ -f "$OUTPUT_FILE" ]; then
             echo "✔ Already exists, skipping"
@@ -273,9 +276,17 @@ jobs:
           MB=$((FILESIZE / 1024 / 1024))
           if [ "$SPLIT_MB" -gt 0 ] && [ "$MB" -gt "$SPLIT_MB" ]; then
             echo "✂️ Splitting (${MB}MB > ${SPLIT_MB}MB)..."
-            cd "$OUT_DIR"
-            zip -r -s "${SPLIT_MB}m" "$(basename "$OUTPUT_FILE").zip" "$(basename "$OUTPUT_FILE")"
-            rm "$(basename "$OUTPUT_FILE")"
+            cd "$BASE"
+            BASENAME=$(basename "$OUTPUT_FILE")
+            NAME="${BASENAME%.*}"
+            if [ "$SPLIT_METHOD" = "zip" ]; then
+              zip -r -s "${SPLIT_MB}m" "${BASENAME}.zip" "$BASENAME"
+              rm "$BASENAME"
+            else
+              # mp4 split using ffmpeg
+              ffmpeg -i "$BASENAME" -c copy -f segment -segment_size "${SPLIT_MB}M" -reset_timestamps 1 "${NAME}_part%03d.${EXT}" < /dev/null
+              rm "$BASENAME"
+            fi
             cd -
           fi
 
@@ -283,49 +294,46 @@ jobs:
           SCRIPT
 
           chmod +x /tmp/process_url.sh
-
-          # Run in parallel
           parallel --jobs "$WORKERS" --line-buffer -a /tmp/url_list/list.txt bash /tmp/process_url.sh
 
       - name: 📤 Commit and Push to Repository
         run: |
           BRANCH="${GITHUB_REF_NAME}"
-          
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Stage all downloaded files
+
           git add "${{ github.event.inputs.download_path }}/"
-          
+
           if git diff --staged --quiet; then
             echo "ℹ️ No changes to commit"
             exit 0
           fi
-          
+
           mapfile -t STAGED_FILES < <(git diff --staged --name-only)
           TOTAL_FILES=${#STAGED_FILES[@]}
-          
+
           echo "📦 Found $TOTAL_FILES file(s) to upload"
-          
+
           git reset HEAD "${{ github.event.inputs.download_path }}/"
-          
+
           BATCH_SIZE=5
           for (( i=0; i<TOTAL_FILES; i+=BATCH_SIZE )); do
             BATCH_NUM=$((i / BATCH_SIZE + 1))
             END=$((i + BATCH_SIZE))
             [[ $END -gt $TOTAL_FILES ]] && END=$TOTAL_FILES
-            
+
             echo "🚀 Uploading batch $BATCH_NUM [$((i+1))–${END} of $TOTAL_FILES]"
-            
+
             for (( j=i; j<END; j++ )); do
               git add "${STAGED_FILES[$j]}"
             done
-            
+
             git commit -m "chore: add YouTube content batch $BATCH_NUM [skip ci]"
             git pull --rebase origin "$BRANCH" || true
             git push origin "HEAD:$BRANCH"
-            
+
             echo "✅ Batch $BATCH_NUM uploaded"
           done
-          
+
           echo "🎉 All files successfully uploaded to $BRANCH"
