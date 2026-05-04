@@ -114,13 +114,13 @@ jobs:
           import sys, json, time, re, requests, os, shutil
 
           if len(sys.argv) != 6:
-              print("Usage: yt_convert.py <url> <type> <quality> <output_file> <temp_dir>")
+              print("Usage: yt_convert.py <url> <type> <quality> <base_dir> <temp_dir>", file=sys.stderr)
               sys.exit(1)
 
           YT_URL = sys.argv[1]
           OUTPUT_TYPE = sys.argv[2]
           QUALITY_INPUT = sys.argv[3]
-          OUTPUT_FILE = sys.argv[4]
+          BASE_DIR = sys.argv[4]
           TEMP_DIR = sys.argv[5]
 
           API_ENDPOINT = "https://hub.ytconvert.org/api/download"
@@ -151,7 +151,7 @@ jobs:
                   return quality_map.get(quality, '720p')
 
           QUALITY = normalize_quality(OUTPUT_TYPE, QUALITY_INPUT)
-          print(f"🎯 {OUTPUT_TYPE.upper()} @ {QUALITY}")
+          print(f"🎯 {OUTPUT_TYPE.upper()} @ {QUALITY}", file=sys.stderr)
 
           HEADERS = {
               "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
@@ -181,12 +181,14 @@ jobs:
                   resp.raise_for_status()
               data = resp.json()
           except Exception as e:
-              print(f"❌ API error: {e}")
+              print(f"❌ API error: {e}", file=sys.stderr)
               sys.exit(1)
 
           status_url = data.get('statusUrl')
+          title = data.get('title', 'youtube_video')
+
           if not status_url:
-              print("❌ No statusUrl")
+              print("❌ No statusUrl", file=sys.stderr)
               sys.exit(1)
 
           download_url = None
@@ -200,16 +202,36 @@ jobs:
                   download_url = sdata.get('downloadUrl')
                   break
               elif sdata.get('status') == 'failed':
-                  print("❌ Conversion failed")
+                  print("❌ Conversion failed", file=sys.stderr)
                   sys.exit(1)
 
           if not download_url:
-              print("⏰ Timeout")
+              print("⏰ Timeout", file=sys.stderr)
               sys.exit(1)
 
-          # Download to temp file
-          temp_file = os.path.join(TEMP_DIR, os.path.basename(OUTPUT_FILE))
-          print(f"⬇️ Downloading to {temp_file}...")
+          # --- Extract video ID (same regex as original) ---
+          video_id_match = re.search(r'(?:v=|\/)([a-zA-Z0-9_-]{11})', YT_URL)
+          video_id = video_id_match.group(1) if video_id_match else "unknown"
+
+          # --- Safe title (exactly like original) ---
+          safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))
+          safe_title = safe_title[:60] if len(safe_title) > 60 else safe_title
+          safe_title = safe_title.strip('_') or video_id
+
+          # --- Determine extension and quality label ---
+          if OUTPUT_TYPE == 'audio':
+              extension = "mp3"
+              quality_label = QUALITY  # e.g. "320kbps"
+          else:
+              extension = "mp4"
+              quality_label = QUALITY  # e.g. "720p"
+
+          filename = f"{safe_title}_{video_id}_{quality_label}.{extension}"
+          final_path = os.path.join(BASE_DIR, filename)
+
+          # --- Download to temp ---
+          temp_file = os.path.join(TEMP_DIR, filename)
+          print(f"⬇️ Downloading to {temp_file}...", file=sys.stderr)
           dl_headers = {
               "User-Agent": HEADERS["User-Agent"],
               "Referer": HEADERS["Referer"]
@@ -220,10 +242,13 @@ jobs:
                   for chunk in r.iter_content(chunk_size=8192):
                       f.write(chunk)
 
-          # Move to final location
-          os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-          shutil.move(temp_file, OUTPUT_FILE)
-          print("✅ Download completed")
+          # --- Move to final location ---
+          os.makedirs(BASE_DIR, exist_ok=True)
+          shutil.move(temp_file, final_path)
+          print(f"✅ Download completed", file=sys.stderr)
+
+          # --- Output ONLY the filename for the bash script ---
+          print(filename)
           PYEOF
 
       - name: ⚡ Download & Process in Parallel
@@ -245,29 +270,19 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━"
           echo "▶ Processing: $URL"
 
-          # Fast metadata lookup
-          META_JSON=$(yt-dlp -J "$URL" 2>/dev/null)
-          TITLE=$(echo "$META_JSON" | jq -r '.title // "video"')
-          VID=$(echo "$META_JSON" | jq -r '.id // "unknown"')
-
-          SAFE_TITLE=$(echo "$TITLE" | sed 's/[^a-zA-Z0-9._-]/_/g')
-
-          EXT="mp4"
-          [ "$TYPE" = "audio" ] && EXT="mp3"
-
-          OUTPUT_FILE="$BASE/${SAFE_TITLE}_${VID}_${QUALITY}.$EXT"
-
-          if [ -f "$OUTPUT_FILE" ]; then
-            echo "✔ Already exists, skipping"
-            exit 0
-          fi
-
-          echo "→ Converting..."
-          python3 /tmp/yt_convert.py "$URL" "$TYPE" "$QUALITY" "$OUTPUT_FILE" "$TEMP_DIR"
+          # Call Python – it returns the final filename (no path)
+          FILENAME=$(python3 /tmp/yt_convert.py "$URL" "$TYPE" "$QUALITY" "$BASE" "$TEMP_DIR")
           STATUS=$?
 
           if [ $STATUS -ne 0 ]; then
-            echo "❌ Conversion failed"
+            echo "❌ Conversion failed for $URL"
+            exit 1
+          fi
+
+          OUTPUT_FILE="$BASE/$FILENAME"
+
+          if [ ! -f "$OUTPUT_FILE" ]; then
+            echo "❌ File missing after conversion: $OUTPUT_FILE"
             exit 1
           fi
 
@@ -277,14 +292,15 @@ jobs:
           if [ "$SPLIT_MB" -gt 0 ] && [ "$MB" -gt "$SPLIT_MB" ]; then
             echo "✂️ Splitting (${MB}MB > ${SPLIT_MB}MB)..."
             cd "$BASE"
-            BASENAME=$(basename "$OUTPUT_FILE")
+            BASENAME="$FILENAME"
             NAME="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
             if [ "$SPLIT_METHOD" = "zip" ]; then
               zip -r -s "${SPLIT_MB}m" "${BASENAME}.zip" "$BASENAME"
               rm "$BASENAME"
             else
-              # mp4 split using ffmpeg
-              ffmpeg -i "$BASENAME" -c copy -f segment -segment_size "${SPLIT_MB}M" -reset_timestamps 1 "${NAME}_part%03d.${EXT}" < /dev/null
+              # MP4 split by size (corrected)
+              ffmpeg -i "$BASENAME" -c copy -f segment -segment_time 99999 -fs "${SPLIT_MB}M" -reset_timestamps 1 "${NAME}_part%03d.${EXT}" < /dev/null
               rm "$BASENAME"
             fi
             cd -
