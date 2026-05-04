@@ -298,14 +298,11 @@ jobs:
           SPLIT_METHOD="${{ github.event.inputs.split_method }}"
           TEMP_DIR=$(mktemp -d)
 
-          # Explicit logging
           echo "🔧 Split threshold: ${SPLIT_MB} MB"
           echo "🔧 Split method:    ${SPLIT_METHOD}"
 
-          # Export for the Python script (still needed)
           export BASE QUALITY TYPE TEMP_DIR
 
-          # Write the worker script – now receives SPLIT_MB and SPLIT_METHOD as arguments
           cat > /tmp/process_url.sh << 'SCRIPT'
           #!/bin/bash
           URL="$1"
@@ -316,7 +313,7 @@ jobs:
           echo "▶ Processing: $URL"
           echo "   Threshold: ${SPLIT_MB} MB | Method: ${SPLIT_METHOD}"
 
-          # Python returns two lines: folder and filename
+          # Python returns folder + filename
           { read -r FOLDER; read -r FILENAME; } < <(python3 /tmp/yt_convert.py "$URL" "$TYPE" "$QUALITY" "$BASE" "$TEMP_DIR")
           STATUS=$?
 
@@ -327,42 +324,56 @@ jobs:
 
           VIDEO_DIR="$BASE/$FOLDER"
           OUTPUT_FILE="$VIDEO_DIR/$FILENAME"
-
-          # Duplicate detection
-          if [ -f "$OUTPUT_FILE" ]; then
-            echo "✔ Already exists (full file), skipping"
-            exit 0
-          fi
-
           NAME="${FILENAME%.*}"
-          if ls "$VIDEO_DIR/${NAME}_part"* 2>/dev/null | head -n1 | grep -q .; then
-            echo "✔ Already exists (split parts found), skipping"
-            exit 0
+          EXT="${FILENAME##*.}"
+
+          # --- Smart duplicate / existing file handling ---
+          DOWNLOADED_HERE=false   # flag to know if we just downloaded the file
+
+          if [ -f "$OUTPUT_FILE" ]; then
+            # Check if already split
+            if ls "$VIDEO_DIR/${NAME}_part"* 2>/dev/null | head -n1 | grep -q .; then
+              echo "✔ Already split, skipping"
+              exit 0
+            fi
+
+            FILESIZE=$(stat -c%s "$OUTPUT_FILE")
+            MB=$((FILESIZE / 1024 / 1024))
+
+            if [ "$SPLIT_MB" -gt 0 ] && [ "$MB" -gt "$SPLIT_MB" ]; then
+              echo "📁 Existing file (${MB}MB) needs splitting; proceeding..."
+              # fall through to split section
+            else
+              echo "✔ Already exists (${MB}MB), no split needed, skipping"
+              exit 0
+            fi
+          else
+            # File doesn't exist – it was just downloaded by Python
+            DOWNLOADED_HERE=true
+            if [ ! -f "$OUTPUT_FILE" ]; then
+              echo "❌ File missing after conversion: $OUTPUT_FILE"
+              exit 1
+            fi
           fi
 
-          if [ ! -f "$OUTPUT_FILE" ]; then
-            echo "❌ File missing after conversion: $OUTPUT_FILE"
-            exit 1
-          fi
-
+          # --- Determine file size ---
           FILESIZE=$(stat -c%s "$OUTPUT_FILE")
           MB=$((FILESIZE / 1024 / 1024))
 
+          # --- Split if needed ---
           if [ "$SPLIT_MB" -gt 0 ] && [ "$MB" -gt "$SPLIT_MB" ]; then
             echo "✂️ Splitting (${MB}MB > ${SPLIT_MB}MB) using method: ${SPLIT_METHOD}"
             cd "$VIDEO_DIR"
             BASENAME="$FILENAME"
-            NAME="${BASENAME%.*}"
-            EXT="${BASENAME##*.}"
 
             if [ "$SPLIT_METHOD" = "zip" ]; then
               if ! zip -r -s "${SPLIT_MB}m" "${BASENAME}.zip" "$BASENAME"; then
-                echo "❌ zip failed, keeping original file"
+                echo "❌ zip split failed"
                 exit 1
               fi
               rm "$BASENAME"
             else
-              # mp4 split by duration
+              # --- mp4 split by duration ---
               DURATION=$(ffprobe -v error -show_entries format=duration \
                 -of default=noprint_wrappers=1:nokey=1 "$BASENAME")
               BITRATE=$(ffprobe -v error -show_entries format=bit_rate \
@@ -379,14 +390,16 @@ jobs:
               echo "→ Splitting by time: ~${SEG_TIME}s per part"
               if ! ffmpeg -i "$BASENAME" -c copy -f segment -segment_time "$SEG_TIME" \
                 -reset_timestamps 1 "${NAME}_part%03d.${EXT}" < /dev/null; then
-                echo "❌ ffmpeg split failed, keeping original file"
+                echo "❌ ffmpeg split failed"
                 exit 1
               fi
               rm "$BASENAME"
             fi
             cd -
           else
-            echo "📁 Size ${MB}MB – below threshold or splitting disabled"
+            if [ "$DOWNLOADED_HERE" = true ]; then
+              echo "📁 File size ${MB}MB – below threshold or splitting disabled"
+            fi
           fi
 
           echo "✔ Done: $OUTPUT_FILE"
@@ -394,7 +407,7 @@ jobs:
 
           chmod +x /tmp/process_url.sh
 
-          # Run parallel, passing SPLIT_MB and SPLIT_METHOD to every job
+          # Pass split parameters as arguments to every job
           parallel --jobs "$WORKERS" --line-buffer \
             -a /tmp/url_list/list.txt \
             bash /tmp/process_url.sh {} "$SPLIT_MB" "$SPLIT_METHOD"
