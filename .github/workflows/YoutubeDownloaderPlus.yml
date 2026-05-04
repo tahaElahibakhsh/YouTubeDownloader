@@ -23,13 +23,13 @@ on:
         default: 'video'
 
       quality:
-        description: '🎚️ Quality (video: p | audio: kbps)'
+        description: '🎚️ Quality (video: 144p/360p/480p/720p/1080p | audio: 64kbps/128kbps/192kbps/320kbps)'
         required: false
         type: string
         default: '720p'
 
       split_threshold_mb:
-        description: '✂️ Split files larger than (MB) — 0 = never'
+        description: '📦 Split files larger than (MB) — 0 = never'
         required: false
         type: number
         default: 90
@@ -48,20 +48,22 @@ on:
 
 jobs:
   download-and-process:
-    name: 🚀 Advanced YouTube Downloader
+    name: 🚀 Download & Process YouTube Content
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
+    
     steps:
       - name: 📂 Clone Repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 🔧 Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y zip curl jq parallel python3-pip
-          pip install yt-dlp
+          pip install requests yt-dlp
 
       - name: 📜 Prepare URL List
         run: |
@@ -79,11 +81,11 @@ jobs:
           > /tmp/url_list/list.txt
 
           while read -r INPUT; do
+            # Expand playlists
             if yt-dlp --flat-playlist -J "$INPUT" >/tmp/pl.json 2>/dev/null; then
               COUNT=$(jq '.entries | length' /tmp/pl.json 2>/dev/null || echo 0)
               if [ "$COUNT" -gt 1 ]; then
                 echo "📂 Playlist detected ($COUNT videos)"
-                # ✅ The .url is already a full YouTube watch URL
                 jq -r '.entries[].url' /tmp/pl.json >> /tmp/url_list/list.txt
                 continue
               fi
@@ -91,118 +93,239 @@ jobs:
             echo "$INPUT" >> /tmp/url_list/list.txt
           done < /tmp/url_list/raw.txt
 
-          echo "Final URLs:"
+          echo "✅ Final URL list:"
           cat /tmp/url_list/list.txt
 
       - name: 🧭 Create Base Directory
-        run: |
-          mkdir -p "${{ github.event.inputs.download_path }}"
+        run: mkdir -p "${{ github.event.inputs.download_path }}"
 
-      - name: ⚡ Download Videos in Parallel
+      - name: 🐍 Write Conversion Helper Script
+        run: |
+          cat > /tmp/yt_convert.py << 'PYEOF'
+          import sys, json, time, re, requests
+
+          if len(sys.argv) != 6:
+              print("Usage: yt_convert.py <url> <type> <quality> <output_file> <temp_dir>")
+              sys.exit(1)
+
+          YT_URL = sys.argv[1]
+          OUTPUT_TYPE = sys.argv[2]
+          QUALITY_INPUT = sys.argv[3]
+          OUTPUT_FILE = sys.argv[4]
+          TEMP_DIR = sys.argv[5]
+
+          API_ENDPOINT = "https://hub.ytconvert.org/api/download"
+          STATUS_CHECK_INTERVAL = 2
+          MAX_ATTEMPTS = 90
+
+          VIDEO_QUALITIES = ['144p', '360p', '480p', '720p', '1080p']
+          AUDIO_BITRATES = ['64kbps', '128kbps', '192kbps', '320kbps']
+
+          def normalize_quality(output_type, quality_input):
+              if output_type == 'audio':
+                  quality = quality_input.lower().strip().replace('p', '')
+                  if 'kbps' not in quality:
+                      quality = quality.replace('k', '') + 'kbps'
+                  if quality in AUDIO_BITRATES:
+                      return quality
+                  bitrate_num = int(''.join(filter(str.isdigit, quality)))
+                  supported_nums = [int(''.join(filter(str.isdigit, b))) for b in AUDIO_BITRATES]
+                  closest = min(supported_nums, key=lambda x: abs(x - bitrate_num))
+                  return [b for b in AUDIO_BITRATES if str(closest) in b][0]
+              else:
+                  quality = quality_input.lower().strip().replace('k', '')
+                  if not quality.endswith('p'):
+                      quality += 'p'
+                  if quality in VIDEO_QUALITIES:
+                      return quality
+                  quality_map = {'240p': '360p', '4k': '1080p', '2160p': '1080p', '1440p': '1080p', '2k': '1080p'}
+                  return quality_map.get(quality, '720p')
+
+          QUALITY = normalize_quality(OUTPUT_TYPE, QUALITY_INPUT)
+          print(f"🎯 {OUTPUT_TYPE.upper()} @ {QUALITY}")
+
+          HEADERS = {
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+              "Accept": "application/json",
+              "Referer": "https://media.ytmp3.gg/",
+              "Content-Type": "application/json",
+              "Origin": "https://media.ytmp3.gg",
+          }
+
+          if OUTPUT_TYPE == 'audio':
+              payload = {"url": YT_URL, "os": "linux", "output": {"type": "audio", "format": "mp3"}, "audio": {"bitrate": QUALITY}}
+          else:
+              payload = {"url": YT_URL, "os": "linux", "output": {"type": "video", "format": "mp4", "quality": QUALITY}}
+
+          session = requests.Session()
+          session.get("https://media.ytmp3.gg/", headers=HEADERS)
+
+          try:
+              resp = session.post(API_ENDPOINT, json=payload, headers=HEADERS, timeout=30)
+              if resp.status_code != 200:
+                  # Fallback on 400
+                  if resp.status_code == 400:
+                      if OUTPUT_TYPE == 'audio':
+                          payload["audio"]["bitrate"] = "192kbps"
+                      else:
+                          payload["output"]["quality"] = "720p"
+                      resp = session.post(API_ENDPOINT, json=payload, headers=HEADERS, timeout=30)
+                  resp.raise_for_status()
+              data = resp.json()
+          except Exception as e:
+              print(f"❌ API error: {e}")
+              sys.exit(1)
+
+          status_url = data.get('statusUrl')
+          if not status_url:
+              print("❌ No statusUrl")
+              sys.exit(1)
+
+          download_url = None
+          for i in range(MAX_ATTEMPTS):
+              time.sleep(STATUS_CHECK_INTERVAL)
+              try:
+                  sdata = session.get(status_url, headers=HEADERS, timeout=15).json()
+              except:
+                  continue
+              if sdata.get('status') == 'completed':
+                  download_url = sdata.get('downloadUrl')
+                  break
+              elif sdata.get('status') == 'failed':
+                  print("❌ Conversion failed")
+                  sys.exit(1)
+
+          if not download_url:
+              print("⏰ Timeout")
+              sys.exit(1)
+
+          # Download to temp file
+          temp_file = TEMP_DIR + "/" + OUTPUT_FILE.rsplit("/", 1)[-1]
+          print(f"⬇️ Downloading to {temp_file}...")
+          dl_headers = {
+              "User-Agent": HEADERS["User-Agent"],
+              "Referer": HEADERS["Referer"]
+          }
+          with session.get(download_url, headers=dl_headers, stream=True, timeout=300) as r:
+              r.raise_for_status()
+              with open(temp_file, 'wb') as f:
+                  for chunk in r.iter_content(chunk_size=8192):
+                      f.write(chunk)
+
+          # Move to final location
+          import shutil, os
+          os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+          shutil.move(temp_file, OUTPUT_FILE)
+          print("✅ Download completed")
+          PYEOF
+
+      - name: ⚡ Download & Process in Parallel
         run: |
           BASE="${{ github.event.inputs.download_path }}"
           WORKERS=${{ github.event.inputs.workers }}
           QUALITY="${{ github.event.inputs.quality }}"
           TYPE="${{ github.event.inputs.type }}"
           SPLIT_MB="${{ github.event.inputs.split_threshold_mb }}"
+          TEMP_DIR=$(mktemp -d)
 
-          export BASE QUALITY TYPE SPLIT_MB
+          export BASE QUALITY TYPE SPLIT_MB TEMP_DIR
 
-          # ✅ Write the script to a temp file
-          cat > /tmp/download_script.sh <<'SCRIPT'
+          # The per‑URL script
+          cat > /tmp/process_url.sh << 'SCRIPT'
           #!/bin/bash
-          YT_URL="$1"
-          
+          URL="$1"
+
           echo "━━━━━━━━━━━━━━━━━━━━━━"
-          echo "▶ Processing: $YT_URL"
-          echo "━━━━━━━━━━━━━━━━━━━━━━"
-          
-          META_JSON=$(yt-dlp -J "$YT_URL" 2>/dev/null)
+          echo "▶ Processing: $URL"
+
+          # Fast metadata lookup
+          META_JSON=$(yt-dlp -J "$URL" 2>/dev/null)
           TITLE=$(echo "$META_JSON" | jq -r '.title // "video"')
           AUTHOR=$(echo "$META_JSON" | jq -r '.uploader // "Unknown"')
-          ID=$(echo "$META_JSON" | jq -r '.id // "unknown"')
-          
-          SAFE_TITLE=$(echo "$TITLE" | sed "s/[^a-zA-Z0-9._-]/_/g")
-          SAFE_AUTHOR=$(echo "$AUTHOR" | sed "s/[^a-zA-Z0-9._-]/_/g")
-          
-          mkdir -p "$BASE/$SAFE_AUTHOR"
-          
+          VID=$(echo "$META_JSON" | jq -r '.id // "unknown"')
+
+          SAFE_TITLE=$(echo "$TITLE" | sed 's/[^a-zA-Z0-9._-]/_/g')
+          SAFE_AUTHOR=$(echo "$AUTHOR" | sed 's/[^a-zA-Z0-9._-]/_/g')
+
           EXT="mp4"
           [ "$TYPE" = "audio" ] && EXT="mp3"
-          
-          OUTPUT_FILE="$BASE/$SAFE_AUTHOR/${SAFE_TITLE}_${ID}_${QUALITY}.$EXT"
-          
+
+          OUT_DIR="$BASE/$SAFE_AUTHOR"
+          mkdir -p "$OUT_DIR"
+          OUTPUT_FILE="$OUT_DIR/${SAFE_TITLE}_${VID}_${QUALITY}.$EXT"
+
           if [ -f "$OUTPUT_FILE" ]; then
-            echo "✔ Skipping duplicate: $OUTPUT_FILE"
+            echo "✔ Already exists, skipping"
             exit 0
           fi
-          
-          echo "→ Converting…"
-          
-          API_PAYLOAD=$(printf '{"url":"%s","os":"linux","output":{"type":"%s","format":"%s","quality":"%s"},"audio":{"bitrate":"%s"}}' \
-            "$YT_URL" "$TYPE" "$EXT" "$QUALITY" "$QUALITY")
-          
-          TASK_JSON=$(curl -s -X POST \
-            -H "Content-Type: application/json" \
-            -d "$API_PAYLOAD" \
-            https://hub.ytconvert.org/api/download)
-          
-          STATUS_URL=$(echo "$TASK_JSON" | jq -r '.statusUrl')
-          
-          if [ "$STATUS_URL" = "null" ]; then
-            echo "❌ Conversion request failed"
+
+          echo "→ Converting..."
+          python3 /tmp/yt_convert.py "$URL" "$TYPE" "$QUALITY" "$OUTPUT_FILE" "$TEMP_DIR"
+          STATUS=$?
+
+          if [ $STATUS -ne 0 ]; then
+            echo "❌ Conversion failed"
             exit 1
           fi
-          
-          for i in {1..90}; do
-            sleep 2
-            STATUS=$(curl -s "$STATUS_URL")
-            STATE=$(echo "$STATUS" | jq -r ".status")
-          
-            if [ "$STATE" = "completed" ]; then
-              DL=$(echo "$STATUS" | jq -r ".downloadUrl")
-              break
-            fi
-          done
-          
-          if [ -z "$DL" ] || [ "$DL" = "null" ]; then
-            echo "❌ Timeout"
-            exit 1
-          fi
-          
-          echo "→ Downloading file…"
-          curl -L --silent "$DL" -o "$OUTPUT_FILE"
-          
+
+          # Split if needed
           FILESIZE=$(stat -c%s "$OUTPUT_FILE")
           MB=$((FILESIZE / 1024 / 1024))
-          
-          if [ $SPLIT_MB -gt 0 ] && [ $MB -gt $SPLIT_MB ]; then
-            cd "$BASE/$SAFE_AUTHOR"
+          if [ "$SPLIT_MB" -gt 0 ] && [ "$MB" -gt "$SPLIT_MB" ]; then
+            echo "✂️ Splitting (${MB}MB > ${SPLIT_MB}MB)..."
+            cd "$OUT_DIR"
             zip -r -s "${SPLIT_MB}m" "$(basename "$OUTPUT_FILE").zip" "$(basename "$OUTPUT_FILE")"
             rm "$(basename "$OUTPUT_FILE")"
             cd -
           fi
-          
-          echo "✔ Finished: $OUTPUT_FILE"
+
+          echo "✔ Done: $OUTPUT_FILE"
           SCRIPT
 
-          chmod +x /tmp/download_script.sh
+          chmod +x /tmp/process_url.sh
 
-          # ✅ Correct parallel invocation
-          parallel --jobs "$WORKERS" --line-buffer -a /tmp/url_list/list.txt bash /tmp/download_script.sh
+          # Run in parallel
+          parallel --jobs "$WORKERS" --line-buffer -a /tmp/url_list/list.txt bash /tmp/process_url.sh
 
-      - name: 📤 Commit & Push
+      - name: 📤 Commit and Push to Repository
         run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
+          
+          # Stage all downloaded files
           git add "${{ github.event.inputs.download_path }}/"
-
+          
           if git diff --staged --quiet; then
-            echo "No new files"
+            echo "ℹ️ No changes to commit"
             exit 0
           fi
-
-          git commit -m "chore: add YouTube content [skip ci]"
-          git pull --rebase origin "${GITHUB_REF_NAME}" || true
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          
+          mapfile -t STAGED_FILES < <(git diff --staged --name-only)
+          TOTAL_FILES=${#STAGED_FILES[@]}
+          
+          echo "📦 Found $TOTAL_FILES file(s) to upload"
+          
+          git reset HEAD "${{ github.event.inputs.download_path }}/"
+          
+          BATCH_SIZE=5
+          for (( i=0; i<TOTAL_FILES; i+=BATCH_SIZE )); do
+            BATCH_NUM=$((i / BATCH_SIZE + 1))
+            END=$((i + BATCH_SIZE))
+            [[ $END -gt $TOTAL_FILES ]] && END=$TOTAL_FILES
+            
+            echo "🚀 Uploading batch $BATCH_NUM [$((i+1))–${END} of $TOTAL_FILES]"
+            
+            for (( j=i; j<END; j++ )); do
+              git add "${STAGED_FILES[$j]}"
+            done
+            
+            git commit -m "chore: add YouTube content batch $BATCH_NUM [skip ci]"
+            git pull --rebase origin "$BRANCH" || true
+            git push origin "HEAD:$BRANCH"
+            
+            echo "✅ Batch $BATCH_NUM uploaded"
+          done
+          
+          echo "🎉 All files successfully uploaded to $BRANCH"
