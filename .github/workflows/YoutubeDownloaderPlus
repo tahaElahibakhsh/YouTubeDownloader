@@ -1,0 +1,226 @@
+name: 🎯 YouTubeDownloader+
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: '🎬 Single YouTube URL (video or playlist)'
+        required: false
+        type: string
+
+      urls:
+        description: '📜 Multiple URLs (one per line)'
+        required: false
+        type: string
+
+      type:
+        description: '📦 Output Type'
+        required: true
+        type: choice
+        options:
+          - video
+          - audio
+        default: 'video'
+
+      quality:
+        description: '🎚️ Quality (video: p | audio: kbps)'
+        required: false
+        type: string
+        default: '720p'
+
+      split_threshold_mb:
+        description: '✂️ Split files larger than (MB) — 0 = never'
+        required: false
+        type: number
+        default: 90
+
+      download_path:
+        description: '📂 Folder to store downloaded content'
+        required: false
+        type: string
+        default: 'downloads'
+
+      workers:
+        description: '⚡ Parallel downloads (recommended: 3–8)'
+        required: false
+        type: number
+        default: 4
+
+
+jobs:
+  download-and-process:
+    name: 🚀 Advanced YouTube Downloader
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📂 Clone Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔧 Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip curl jq python3-pip
+          pip install yt-dlp
+
+      - name: 📜 Prepare URL List (Single, Multi, Playlists)
+        id: urls
+        run: |
+          mkdir -p /tmp/url_list
+
+          if [ -n "${{ github.event.inputs.urls }}" ]; then
+            echo "${{ github.event.inputs.urls }}" | sed '/^\s*$/d' > /tmp/url_list/raw.txt
+          elif [ -n "${{ github.event.inputs.url }}" ]; then
+            echo "${{ github.event.inputs.url }}" > /tmp/url_list/raw.txt
+          else
+            echo "❌ No URL provided"
+            exit 1
+          fi
+
+          echo "🔍 Expanding playlists…"
+          > /tmp/url_list/list.txt
+
+          while read -r INPUT; do
+            if yt-dlp --flat-playlist -J "$INPUT" >/tmp/pl.json 2>/dev/null; then
+              COUNT=$(jq '.entries | length' /tmp/pl.json 2>/dev/null || echo 0)
+              if [ "$COUNT" -gt 1 ]; then
+                echo "📂 Playlist found ($COUNT videos)"
+                jq -r '.entries[].url' /tmp/pl.json | sed 's_^_https://www.youtube.com/watch?v=_' >> /tmp/url_list/list.txt
+                continue
+              fi
+            fi
+            echo "$INPUT" >> /tmp/url_list/list.txt
+          done < /tmp/url_list/raw.txt
+
+          echo "━━━━━━━━━━━━━━━━━━━"
+          echo "📌 Final URL list:"
+          cat /tmp/url_list/list.txt
+          echo "━━━━━━━━━━━━━━━━━━━"
+
+      - name: 🧭 Prepare Directories
+        run: |
+          BASE="${{ github.event.inputs.download_path }}"
+          mkdir -p "$BASE"
+
+      - name: 🎯 Start Parallel Conversions
+        run: |
+          BASE="${{ github.event.inputs.download_path }}"
+          WORKERS=${{ github.event.inputs.workers }}
+          QUALITY="${{ github.event.inputs.quality }}"
+          TYPE="${{ github.event.inputs.type }}"
+          SPLIT_MB="${{ github.event.inputs.split_threshold_mb }}"
+
+          parallel --jobs $WORKERS --line-buffer '
+          
+            YT_URL={};
+            echo "━━━━━━━━━━━━━━━━━━━━━━"
+            echo "▶ Processing: $YT_URL"
+            echo "━━━━━━━━━━━━━━━━━━━━━━"
+
+            META=$(yt-dlp --get-title --print "%(uploader)s" --print "%(id)s" "$YT_URL" 2>/dev/null)
+
+            TITLE=$(echo "$META" | sed -n "1p")
+            AUTHOR=$(echo "$META" | sed -n "2p")
+            ID=$(echo "$META" | sed -n "3p")
+
+            SAFE_AUTHOR=$(echo "$AUTHOR" | sed "s/[^a-zA-Z0-9._-]/_/g")
+            SAFE_TITLE=$(echo "$TITLE" | sed "s/[^a-zA-Z0-9._-]/_/g")
+            mkdir -p "$BASE/$SAFE_AUTHOR"
+
+            OUTPUT_FILE="$BASE/$SAFE_AUTHOR/${SAFE_TITLE}_${ID}_${QUALITY}"
+
+            if [ -f "$OUTPUT_FILE.mp4" ] || [ -f "$OUTPUT_FILE.mp3" ]; then
+              echo "✔ Skipping duplicate: $OUTPUT_FILE"
+              exit 0
+            fi
+
+            API_PAYLOAD=$(python3 - <<EOF
+import json
+print(json.dumps({
+  "url": "$YT_URL",
+  "os": "linux",
+  "output": {"type": "$TYPE", "format": "mp4" if "$TYPE"=="video" else "mp3", "quality": "$QUALITY"},
+  "audio": {"bitrate": "$QUALITY"} if "$TYPE"=="audio" else None
+}))
+EOF
+)
+
+            curl -s -X POST \
+              -H "Content-Type: application/json" \
+              -d "$API_PAYLOAD" \
+              https://hub.ytconvert.org/api/download \
+              > /tmp/task_$ID.json
+
+            STATUS_URL=$(jq -r '.statusUrl' /tmp/task_$ID.json)
+            if [ "$STATUS_URL" = "null" ]; then
+              echo "❌ Conversion request failed for: $YT_URL"
+              exit 1
+            fi
+
+            for i in {1..90}; do
+              sleep 2
+              STATUS=$(curl -s "$STATUS_URL")
+              STATE=$(echo "$STATUS" | jq -r ".status")
+
+              if [ "$STATE" = "completed" ]; then
+                DL=$(echo "$STATUS" | jq -r ".downloadUrl")
+                break
+              fi
+            done
+
+            if [ -z "$DL" ]; then
+              echo "❌ Timeout: $YT_URL"
+              exit 1
+            fi
+
+            EXT="mp4"
+            [ "$TYPE" = "audio" ] && EXT="mp3"
+
+            curl -L --silent "$DL" -o "$OUTPUT_FILE.$EXT"
+
+            FILESIZE=$(stat -c%s "$OUTPUT_FILE.$EXT")
+            MB=$((FILESIZE / 1024 / 1024))
+
+            if [ $SPLIT_MB -gt 0 ] && [ $MB -gt $SPLIT_MB ]; then
+              cd "$BASE/$SAFE_AUTHOR"
+              zip -r -s "${SPLIT_MB}m" "$(basename $OUTPUT_FILE.$EXT).zip" "$(basename $OUTPUT_FILE.$EXT)"
+              rm "$OUTPUT_FILE.$EXT"
+              cd -
+            fi
+
+            echo "✔ Finished: $OUTPUT_FILE"
+          
+          ' :::: /tmp/url_list/list.txt
+
+      - name: 📤 Commit and Push Results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ github.event.inputs.download_path }}/"
+
+          if git diff --staged --quiet; then
+            echo "ℹ No new files"
+            exit 0
+          fi
+
+          BATCH=1
+          git diff --staged --name-only > /tmp/files.txt
+          split -l 20 /tmp/files.txt /tmp/batch_
+          
+          for f in /tmp/batch_*; do
+            while read -r FILE; do
+              git add "$FILE"
+            done < "$f"
+
+            git commit -m "chore: add YouTube media batch $BATCH [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+
+            BATCH=$((BATCH+1))
+          done
+
+          echo "🎉 All files uploaded!"
