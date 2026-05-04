@@ -83,9 +83,8 @@ jobs:
               COUNT=$(jq '.entries | length' /tmp/pl.json 2>/dev/null || echo 0)
               if [ "$COUNT" -gt 1 ]; then
                 echo "📂 Playlist detected ($COUNT videos)"
-                jq -r '.entries[].url' /tmp/pl.json \
-                  | sed 's_^_https://www.youtube.com/watch?v=_' \
-                  >> /tmp/url_list/list.txt
+                # ✅ The .url is already a full YouTube watch URL
+                jq -r '.entries[].url' /tmp/pl.json >> /tmp/url_list/list.txt
                 continue
               fi
             fi
@@ -109,7 +108,8 @@ jobs:
 
           export BASE QUALITY TYPE SPLIT_MB
 
-          parallel --jobs "$WORKERS" --line-buffer <<'EOF'
+          # ✅ Write the script to a temp file
+          cat > /tmp/download_script.sh <<'SCRIPT'
           #!/bin/bash
           YT_URL="$1"
           
@@ -184,8 +184,12 @@ jobs:
           fi
           
           echo "✔ Finished: $OUTPUT_FILE"
-          EOF
-        </tmp/url_list/list.txt
+          SCRIPT
+
+          chmod +x /tmp/download_script.sh
+
+          # ✅ Correct parallel invocation
+          parallel --jobs "$WORKERS" --line-buffer -a /tmp/url_list/list.txt bash /tmp/download_script.sh
 
       - name: 📤 Commit & Push
         run: |
@@ -202,4 +206,3 @@ jobs:
           git commit -m "chore: add YouTube content [skip ci]"
           git pull --rebase origin "${GITHUB_REF_NAME}" || true
           git push origin "HEAD:${GITHUB_REF_NAME}"
-`
