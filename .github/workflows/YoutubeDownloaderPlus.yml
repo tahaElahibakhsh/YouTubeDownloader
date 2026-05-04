@@ -71,7 +71,7 @@ jobs:
       - name: 🔧 Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y zip curl jq parallel python3-pip ffmpeg
+          sudo apt-get install -y zip curl jq parallel python3-pip ffmpeg bc
           pip install requests yt-dlp
 
       - name: 📜 Prepare URL List
@@ -90,7 +90,6 @@ jobs:
           > /tmp/url_list/list.txt
 
           while read -r INPUT; do
-            # Expand playlists
             if yt-dlp --flat-playlist -J "$INPUT" >/tmp/pl.json 2>/dev/null; then
               COUNT=$(jq '.entries | length' /tmp/pl.json 2>/dev/null || echo 0)
               if [ "$COUNT" -gt 1 ]; then
@@ -209,27 +208,23 @@ jobs:
               print("⏰ Timeout", file=sys.stderr)
               sys.exit(1)
 
-          # --- Extract video ID (same regex as original) ---
           video_id_match = re.search(r'(?:v=|\/)([a-zA-Z0-9_-]{11})', YT_URL)
           video_id = video_id_match.group(1) if video_id_match else "unknown"
 
-          # --- Safe title (exactly like original) ---
           safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))
           safe_title = safe_title[:60] if len(safe_title) > 60 else safe_title
           safe_title = safe_title.strip('_') or video_id
 
-          # --- Determine extension and quality label ---
           if OUTPUT_TYPE == 'audio':
               extension = "mp3"
-              quality_label = QUALITY  # e.g. "320kbps"
+              quality_label = QUALITY
           else:
               extension = "mp4"
-              quality_label = QUALITY  # e.g. "720p"
+              quality_label = QUALITY
 
           filename = f"{safe_title}_{video_id}_{quality_label}.{extension}"
           final_path = os.path.join(BASE_DIR, filename)
 
-          # --- Download to temp ---
           temp_file = os.path.join(TEMP_DIR, filename)
           print(f"⬇️ Downloading to {temp_file}...", file=sys.stderr)
           dl_headers = {
@@ -242,12 +237,10 @@ jobs:
                   for chunk in r.iter_content(chunk_size=8192):
                       f.write(chunk)
 
-          # --- Move to final location ---
           os.makedirs(BASE_DIR, exist_ok=True)
           shutil.move(temp_file, final_path)
           print(f"✅ Download completed", file=sys.stderr)
 
-          # --- Output ONLY the filename for the bash script ---
           print(filename)
           PYEOF
 
@@ -270,7 +263,6 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━"
           echo "▶ Processing: $URL"
 
-          # Call Python – it returns the final filename (no path)
           FILENAME=$(python3 /tmp/yt_convert.py "$URL" "$TYPE" "$QUALITY" "$BASE" "$TEMP_DIR")
           STATUS=$?
 
@@ -286,21 +278,42 @@ jobs:
             exit 1
           fi
 
-          # Split if needed
           FILESIZE=$(stat -c%s "$OUTPUT_FILE")
           MB=$((FILESIZE / 1024 / 1024))
+
           if [ "$SPLIT_MB" -gt 0 ] && [ "$MB" -gt "$SPLIT_MB" ]; then
             echo "✂️ Splitting (${MB}MB > ${SPLIT_MB}MB)..."
             cd "$BASE"
             BASENAME="$FILENAME"
             NAME="${BASENAME%.*}"
             EXT="${BASENAME##*.}"
+
             if [ "$SPLIT_METHOD" = "zip" ]; then
               zip -r -s "${SPLIT_MB}m" "${BASENAME}.zip" "$BASENAME"
               rm "$BASENAME"
             else
-              # MP4 split by size (corrected)
-              ffmpeg -i "$BASENAME" -c copy -f segment -segment_time 99999 -fs "${SPLIT_MB}M" -reset_timestamps 1 "${NAME}_part%03d.${EXT}" < /dev/null
+              # ----- mp4 split by duration (playable parts) -----
+              # Get duration (seconds) and overall bitrate (bits/s)
+              DURATION=$(ffprobe -v error -show_entries format=duration \
+                -of default=noprint_wrappers=1:nokey=1 "$BASENAME")
+              BITRATE=$(ffprobe -v error -show_entries format=bit_rate \
+                -of default=noprint_wrappers=1:nokey=1 "$BASENAME")
+
+              if [ -n "$DURATION" ] && [ -n "$BITRATE" ] && [ "$BITRATE" != "N/A" ]; then
+                # Target size per part: 90% of threshold to stay safe
+                TARGET_BYTES=$(echo "$SPLIT_MB * 1024 * 1024 * 0.9" | bc)
+                # segment_time = target_bytes * 8 / bitrate
+                SEG_TIME=$(echo "scale=2; $TARGET_BYTES * 8 / $BITRATE" | bc)
+                # Ensure segment_time is not ridiculously small
+                SEG_TIME=$(echo "if ($SEG_TIME < 10) 10 else $SEG_TIME" | bc)
+              else
+                # Fallback: 10-minute chunks
+                SEG_TIME=600
+              fi
+
+              echo "→ Splitting by time: ~${SEG_TIME}s per part"
+              ffmpeg -i "$BASENAME" -c copy -f segment -segment_time "$SEG_TIME" \
+                -reset_timestamps 1 "${NAME}_part%03d.${EXT}" < /dev/null
               rm "$BASENAME"
             fi
             cd -
