@@ -148,7 +148,7 @@ jobs:
           STATUS_CHECK_INTERVAL = 2
           MAX_ATTEMPTS = 90
           RETRY_SERVER_ERRORS = [500, 502, 503, 504]
-          MAX_API_RETRIES = 1  # total attempts = 1 + retry
+          MAX_API_RETRIES = 1
 
           VIDEO_QUALITIES = ['144p', '360p', '480p', '720p', '1080p']
           AUDIO_BITRATES = ['64kbps', '128kbps', '192kbps', '320kbps']
@@ -213,13 +213,12 @@ jobs:
               resp = api_post(payload)
               if resp.status_code != 200:
                   if resp.status_code == 400:
-                      # Fallback quality on 400 errors
                       if OUTPUT_TYPE == 'audio':
                           payload["audio"]["bitrate"] = "192kbps"
                       else:
                           payload["output"]["quality"] = "720p"
                       resp = api_post(payload)
-                  if resp.status_code not in RETRY_SERVER_ERRORS:  # only raise for non-retriable errors
+                  if resp.status_code not in RETRY_SERVER_ERRORS:
                       resp.raise_for_status()
               data = resp.json()
           except Exception as e:
@@ -251,11 +250,9 @@ jobs:
               print("⏰ Timeout", file=sys.stderr)
               sys.exit(1)
 
-          # --- Extract video ID ---
           video_id_match = re.search(r'(?:v=|\/)([a-zA-Z0-9_-]{11})', YT_URL)
           video_id = video_id_match.group(1) if video_id_match else "unknown"
 
-          # --- Safe title for folder & filename ---
           safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))
           safe_title = safe_title[:60] if len(safe_title) > 60 else safe_title
           safe_title = safe_title.strip('_') or video_id
@@ -268,12 +265,9 @@ jobs:
               quality_label = QUALITY
 
           filename = f"{safe_title}_{video_id}_{quality_label}.{extension}"
-
-          # --- Folder structure: downloads/<safe_title>/filename ---
           folder = safe_title
           final_path = os.path.join(BASE_DIR, folder, filename)
 
-          # --- Download to temp ---
           temp_file = os.path.join(TEMP_DIR, filename)
           print(f"⬇️ Downloading to {temp_file}...", file=sys.stderr)
           dl_headers = {
@@ -304,16 +298,25 @@ jobs:
           SPLIT_METHOD="${{ github.event.inputs.split_method }}"
           TEMP_DIR=$(mktemp -d)
 
-          export BASE QUALITY TYPE SPLIT_MB SPLIT_METHOD TEMP_DIR
+          # Explicit logging
+          echo "🔧 Split threshold: ${SPLIT_MB} MB"
+          echo "🔧 Split method:    ${SPLIT_METHOD}"
 
+          # Export for the Python script (still needed)
+          export BASE QUALITY TYPE TEMP_DIR
+
+          # Write the worker script – now receives SPLIT_MB and SPLIT_METHOD as arguments
           cat > /tmp/process_url.sh << 'SCRIPT'
           #!/bin/bash
           URL="$1"
+          SPLIT_MB="$2"
+          SPLIT_METHOD="$3"
 
           echo "━━━━━━━━━━━━━━━━━━━━━━"
           echo "▶ Processing: $URL"
+          echo "   Threshold: ${SPLIT_MB} MB | Method: ${SPLIT_METHOD}"
 
-          # Python returns two lines: first = folder, second = filename
+          # Python returns two lines: folder and filename
           { read -r FOLDER; read -r FILENAME; } < <(python3 /tmp/yt_convert.py "$URL" "$TYPE" "$QUALITY" "$BASE" "$TEMP_DIR")
           STATUS=$?
 
@@ -325,7 +328,7 @@ jobs:
           VIDEO_DIR="$BASE/$FOLDER"
           OUTPUT_FILE="$VIDEO_DIR/$FILENAME"
 
-          # --- Duplicate detection: skip if full file or split parts already exist ---
+          # Duplicate detection
           if [ -f "$OUTPUT_FILE" ]; then
             echo "✔ Already exists (full file), skipping"
             exit 0
@@ -337,7 +340,6 @@ jobs:
             exit 0
           fi
 
-          # The file should now exist after Python script
           if [ ! -f "$OUTPUT_FILE" ]; then
             echo "❌ File missing after conversion: $OUTPUT_FILE"
             exit 1
@@ -346,19 +348,21 @@ jobs:
           FILESIZE=$(stat -c%s "$OUTPUT_FILE")
           MB=$((FILESIZE / 1024 / 1024))
 
-          # --- Splitting ---
           if [ "$SPLIT_MB" -gt 0 ] && [ "$MB" -gt "$SPLIT_MB" ]; then
-            echo "✂️ Splitting (${MB}MB > ${SPLIT_MB}MB)..."
+            echo "✂️ Splitting (${MB}MB > ${SPLIT_MB}MB) using method: ${SPLIT_METHOD}"
             cd "$VIDEO_DIR"
             BASENAME="$FILENAME"
             NAME="${BASENAME%.*}"
             EXT="${BASENAME##*.}"
 
             if [ "$SPLIT_METHOD" = "zip" ]; then
-              zip -r -s "${SPLIT_MB}m" "${BASENAME}.zip" "$BASENAME"
+              if ! zip -r -s "${SPLIT_MB}m" "${BASENAME}.zip" "$BASENAME"; then
+                echo "❌ zip failed, keeping original file"
+                exit 1
+              fi
               rm "$BASENAME"
             else
-              # mp4 split by duration (playable parts)
+              # mp4 split by duration
               DURATION=$(ffprobe -v error -show_entries format=duration \
                 -of default=noprint_wrappers=1:nokey=1 "$BASENAME")
               BITRATE=$(ffprobe -v error -show_entries format=bit_rate \
@@ -373,18 +377,27 @@ jobs:
               fi
 
               echo "→ Splitting by time: ~${SEG_TIME}s per part"
-              ffmpeg -i "$BASENAME" -c copy -f segment -segment_time "$SEG_TIME" \
-                -reset_timestamps 1 "${NAME}_part%03d.${EXT}" < /dev/null
+              if ! ffmpeg -i "$BASENAME" -c copy -f segment -segment_time "$SEG_TIME" \
+                -reset_timestamps 1 "${NAME}_part%03d.${EXT}" < /dev/null; then
+                echo "❌ ffmpeg split failed, keeping original file"
+                exit 1
+              fi
               rm "$BASENAME"
             fi
             cd -
+          else
+            echo "📁 Size ${MB}MB – below threshold or splitting disabled"
           fi
 
           echo "✔ Done: $OUTPUT_FILE"
           SCRIPT
 
           chmod +x /tmp/process_url.sh
-          parallel --jobs "$WORKERS" --line-buffer -a /tmp/url_list/list.txt bash /tmp/process_url.sh
+
+          # Run parallel, passing SPLIT_MB and SPLIT_METHOD to every job
+          parallel --jobs "$WORKERS" --line-buffer \
+            -a /tmp/url_list/list.txt \
+            bash /tmp/process_url.sh {} "$SPLIT_MB" "$SPLIT_METHOD"
 
       - name: 📤 Commit and Push to Repository
         run: |
