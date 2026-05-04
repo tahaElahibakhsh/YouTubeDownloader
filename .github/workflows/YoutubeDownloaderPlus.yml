@@ -9,9 +9,20 @@ on:
         type: string
 
       urls:
-        description: '📜 Multiple URLs (one per line)'
+        description: '📜 Multiple URLs (separated by chosen delimiter)'
         required: false
         type: string
+
+      url_separator:
+        description: '🔹 Delimiter for multiple URLs'
+        required: false
+        type: choice
+        options:
+          - ', (comma)'
+          - 'space'
+          - '; (semicolon)'
+          - '| (pipe)'
+        default: ', (comma)'
 
       type:
         description: '📦 Output Type'
@@ -77,23 +88,37 @@ jobs:
       - name: 📜 Prepare URL List
         run: |
           mkdir -p /tmp/url_list
+          > /tmp/url_list/list.txt
 
+          # --- Determine separator character ---
+          case "${{ github.event.inputs.url_separator }}" in
+            ", (comma)")  SEP=",";;
+            "space")      SEP=" ";;
+            "; (semicolon)") SEP=";";;
+            "| (pipe)")   SEP="|";;
+            *)            SEP=",";;
+          esac
+
+          # --- Collect raw URLs: from 'urls' input (split by SEP) and from 'url' input ---
           if [ -n "${{ github.event.inputs.urls }}" ]; then
-            echo "${{ github.event.inputs.urls }}" | sed '/^\s*$/d' > /tmp/url_list/raw.txt
-          elif [ -n "${{ github.event.inputs.url }}" ]; then
-            echo "${{ github.event.inputs.url }}" > /tmp/url_list/raw.txt
-          else
+            echo "${{ github.event.inputs.urls }}" | tr "$SEP" '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | sed '/^\s*$/d' > /tmp/url_list/raw.txt
+          fi
+
+          if [ -n "${{ github.event.inputs.url }}" ]; then
+            echo "${{ github.event.inputs.url }}" >> /tmp/url_list/raw.txt
+          fi
+
+          if [ ! -s /tmp/url_list/raw.txt ]; then
             echo "❌ No URL provided"
             exit 1
           fi
 
-          > /tmp/url_list/list.txt
-
+          # --- Expand playlists ---
           while read -r INPUT; do
             if yt-dlp --flat-playlist -J "$INPUT" >/tmp/pl.json 2>/dev/null; then
               COUNT=$(jq '.entries | length' /tmp/pl.json 2>/dev/null || echo 0)
               if [ "$COUNT" -gt 1 ]; then
-                echo "📂 Playlist detected ($COUNT videos)"
+                echo "📂 Playlist detected ($COUNT videos): $INPUT"
                 jq -r '.entries[].url' /tmp/pl.json >> /tmp/url_list/list.txt
                 continue
               fi
@@ -208,13 +233,16 @@ jobs:
               print("⏰ Timeout", file=sys.stderr)
               sys.exit(1)
 
+          # --- Extract video ID ---
           video_id_match = re.search(r'(?:v=|\/)([a-zA-Z0-9_-]{11})', YT_URL)
           video_id = video_id_match.group(1) if video_id_match else "unknown"
 
+          # --- Safe title for folder & filename ---
           safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))
           safe_title = safe_title[:60] if len(safe_title) > 60 else safe_title
           safe_title = safe_title.strip('_') or video_id
 
+          # --- Determine extension & quality label ---
           if OUTPUT_TYPE == 'audio':
               extension = "mp3"
               quality_label = QUALITY
@@ -223,8 +251,12 @@ jobs:
               quality_label = QUALITY
 
           filename = f"{safe_title}_{video_id}_{quality_label}.{extension}"
-          final_path = os.path.join(BASE_DIR, filename)
 
+          # --- Folder structure: downloads/<safe_title>/filename ---
+          folder = safe_title
+          final_path = os.path.join(BASE_DIR, folder, filename)
+
+          # --- Download to temp ---
           temp_file = os.path.join(TEMP_DIR, filename)
           print(f"⬇️ Downloading to {temp_file}...", file=sys.stderr)
           dl_headers = {
@@ -237,10 +269,13 @@ jobs:
                   for chunk in r.iter_content(chunk_size=8192):
                       f.write(chunk)
 
-          os.makedirs(BASE_DIR, exist_ok=True)
+          # --- Move to final location ---
+          os.makedirs(os.path.dirname(final_path), exist_ok=True)
           shutil.move(temp_file, final_path)
           print(f"✅ Download completed", file=sys.stderr)
 
+          # --- Output folder and filename (two lines) for the bash wrapper ---
+          print(folder)
           print(filename)
           PYEOF
 
@@ -263,7 +298,8 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━"
           echo "▶ Processing: $URL"
 
-          FILENAME=$(python3 /tmp/yt_convert.py "$URL" "$TYPE" "$QUALITY" "$BASE" "$TEMP_DIR")
+          # Python returns two lines: first = folder, second = filename
+          { read -r FOLDER; read -r FILENAME; } < <(python3 /tmp/yt_convert.py "$URL" "$TYPE" "$QUALITY" "$BASE" "$TEMP_DIR")
           STATUS=$?
 
           if [ $STATUS -ne 0 ]; then
@@ -271,8 +307,23 @@ jobs:
             exit 1
           fi
 
-          OUTPUT_FILE="$BASE/$FILENAME"
+          VIDEO_DIR="$BASE/$FOLDER"
+          OUTPUT_FILE="$VIDEO_DIR/$FILENAME"
 
+          # --- Duplicate detection ---
+          if [ -f "$OUTPUT_FILE" ]; then
+            echo "✔ Already exists (full file), skipping"
+            exit 0
+          fi
+
+          # Check if a previous split exists (parts)
+          NAME="${FILENAME%.*}"
+          if ls "$VIDEO_DIR/${NAME}_part"* 2>/dev/null | head -n1 | grep -q .; then
+            echo "✔ Already exists (split parts found), skipping"
+            exit 0
+          fi
+
+          # The file should now exist after Python script
           if [ ! -f "$OUTPUT_FILE" ]; then
             echo "❌ File missing after conversion: $OUTPUT_FILE"
             exit 1
@@ -281,9 +332,10 @@ jobs:
           FILESIZE=$(stat -c%s "$OUTPUT_FILE")
           MB=$((FILESIZE / 1024 / 1024))
 
+          # --- Splitting ---
           if [ "$SPLIT_MB" -gt 0 ] && [ "$MB" -gt "$SPLIT_MB" ]; then
             echo "✂️ Splitting (${MB}MB > ${SPLIT_MB}MB)..."
-            cd "$BASE"
+            cd "$VIDEO_DIR"
             BASENAME="$FILENAME"
             NAME="${BASENAME%.*}"
             EXT="${BASENAME##*.}"
@@ -292,23 +344,18 @@ jobs:
               zip -r -s "${SPLIT_MB}m" "${BASENAME}.zip" "$BASENAME"
               rm "$BASENAME"
             else
-              # ----- mp4 split by duration (playable parts) -----
-              # Get duration (seconds) and overall bitrate (bits/s)
+              # mp4 split by duration (playable parts)
               DURATION=$(ffprobe -v error -show_entries format=duration \
                 -of default=noprint_wrappers=1:nokey=1 "$BASENAME")
               BITRATE=$(ffprobe -v error -show_entries format=bit_rate \
                 -of default=noprint_wrappers=1:nokey=1 "$BASENAME")
 
               if [ -n "$DURATION" ] && [ -n "$BITRATE" ] && [ "$BITRATE" != "N/A" ]; then
-                # Target size per part: 90% of threshold to stay safe
                 TARGET_BYTES=$(echo "$SPLIT_MB * 1024 * 1024 * 0.9" | bc)
-                # segment_time = target_bytes * 8 / bitrate
                 SEG_TIME=$(echo "scale=2; $TARGET_BYTES * 8 / $BITRATE" | bc)
-                # Ensure segment_time is not ridiculously small
                 SEG_TIME=$(echo "if ($SEG_TIME < 10) 10 else $SEG_TIME" | bc)
               else
-                # Fallback: 10-minute chunks
-                SEG_TIME=600
+                SEG_TIME=600   # fallback: 10 minutes
               fi
 
               echo "→ Splitting by time: ~${SEG_TIME}s per part"
